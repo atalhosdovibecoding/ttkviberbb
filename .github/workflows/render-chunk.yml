@@ -16,7 +16,7 @@ on:
         required: true
         type: string
       props_url:
-        description: 'Props JSON URL'
+        description: 'Props as base64 data URI'
         required: true
         type: string
       start_frame:
@@ -27,40 +27,104 @@ on:
         description: 'End frame'
         required: true
         type: string
+
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Install Remotion CLI
-        run: npm install -g @remotion/cli
-
-      - name: Decode props
+      - name: Decode props from base64
         run: |
-          echo "${{ inputs.props_url }}" | sed 's|data:application/json;base64,||' | base64 -d > props.json
-          echo "Props decoded:"
-          cat props.json | head -c 500
+          echo "Decoding props..."
+          PROPS_URL="${{ inputs.props_url }}"
+          # Remove data URI prefix and decode base64
+          echo "$PROPS_URL" | sed 's|data:application/json;base64,||' | base64 -d > props.json
+          echo "Props decoded (first 300 chars):"
+          cat props.json | head -c 300
+          echo ""
 
-      - name: Render chunk with Remotion
+      - name: Extract video info from props
+        id: video_info
         run: |
-          echo "Rendering frames ${{ inputs.start_frame }} to ${{ inputs.end_frame }}"
-          npx remotion render \
-            VideoComposition \
-            chunk-${{ inputs.chunk_id }}.mp4 \
-            --props=props.json \
-            --frames=${{ inputs.start_frame }}-${{ inputs.end_frame }} \
-            --codec=h264 \
-            --crf=23 \
-            --concurrency=2
+          FPS=$(cat props.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('fps', 30))")
+          WIDTH=$(cat props.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('width', 1080))")
+          HEIGHT=$(cat props.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('height', 1920))")
+          DURATION=$(cat props.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('durationInFrames', 450))")
+          echo "fps=$FPS" >> $GITHUB_OUTPUT
+          echo "width=$WIDTH" >> $GITHUB_OUTPUT
+          echo "height=$HEIGHT" >> $GITHUB_OUTPUT
+          echo "durationInFrames=$DURATION" >> $GITHUB_OUTPUT
+          echo "Video: ${WIDTH}x${HEIGHT} @ ${FPS}fps, ${DURATION} frames"
+
+      - name: Extract and save video asset
+        run: |
+          VIDEO_SRC=$(cat props.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('videoSrc', ''))")
+          echo "VideoSrc type: \${VIDEO_SRC:0:30}"
+          
+          if [[ "$VIDEO_SRC" == data:* ]]; then
+            echo "Decoding video from data URI..."
+            echo "$VIDEO_SRC" | sed 's|data:[^;]*;base64,||' | base64 -d > input-video.mp4
+            ls -lh input-video.mp4
+          else
+            echo "Downloading video from URL: $VIDEO_SRC"
+            curl -L -o input-video.mp4 "$VIDEO_SRC"
+            ls -lh input-video.mp4
+          fi
+
+      - name: Extract audio if present
+        run: |
+          AUDIO_SRC=$(cat props.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('audioSrc') or '')" 2>/dev/null || echo "")
+          
+          if [[ -n "$AUDIO_SRC" && "$AUDIO_SRC" != "None" ]]; then
+            echo "Audio found, extracting..."
+            if [[ "$AUDIO_SRC" == data:* ]]; then
+              echo "$AUDIO_SRC" | sed 's|data:[^;]*;base64,||' | base64 -d > input-audio.mp3
+              ls -lh input-audio.mp3
+            else
+              curl -L -o input-audio.mp3 "$AUDIO_SRC"
+              ls -lh input-audio.mp3
+            fi
+          else
+            echo "No audio track"
+          fi
+
+      - name: Setup FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v3
+
+      - name: Render video with FFmpeg
+        run: |
+          START_FRAME="${{ inputs.start_frame }}"
+          END_FRAME="${{ inputs.end_frame }}"
+          FPS="${{ steps.video_info.outputs.fps }}"
+          WIDTH="${{ steps.video_info.outputs.width }}"
+          HEIGHT="${{ steps.video_info.outputs.height }}"
+          
+          START_TIME=$(echo "scale=4; $START_FRAME / $FPS" | bc)
+          DURATION_FRAMES=$((END_FRAME - START_FRAME + 1))
+          DURATION_TIME=$(echo "scale=4; $DURATION_FRAMES / $FPS" | bc)
+          
+          echo "Rendering frames $START_FRAME-$END_FRAME"
+          echo "Start: ${START_TIME}s, Duration: ${DURATION_TIME}s"
+          
+          if [ -f "input-audio.mp3" ]; then
+            ffmpeg -ss "$START_TIME" -t "$DURATION_TIME" -i input-video.mp4 \
+              -ss "$START_TIME" -t "$DURATION_TIME" -i input-audio.mp3 \
+              -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
+              -c:v libx264 -crf 23 -preset fast \
+              -c:a aac -b:a 128k \
+              -map 0:v:0 -map 1:a:0 \
+              -shortest -y \
+              chunk-${{ inputs.chunk_id }}.mp4
+          else
+            ffmpeg -ss "$START_TIME" -t "$DURATION_TIME" -i input-video.mp4 \
+              -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2" \
+              -c:v libx264 -crf 23 -preset fast \
+              -an -y \
+              chunk-${{ inputs.chunk_id }}.mp4
+          fi
+          
+          ls -lh chunk-${{ inputs.chunk_id }}.mp4
 
       - name: Upload chunk artifact
         uses: actions/upload-artifact@v4
