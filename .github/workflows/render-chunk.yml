@@ -1,0 +1,71 @@
+name: Render Video Chunk
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Render job ID'
+        required: true
+        type: string
+      chunk_id:
+        description: 'Chunk ID'
+        required: true
+        type: string
+      variation_id:
+        description: 'Variation ID'
+        required: true
+        type: string
+      props_url:
+        description: 'Props JSON URL'
+        required: true
+        type: string
+      start_frame:
+        description: 'Start frame'
+        required: true
+        type: string
+      end_frame:
+        description: 'End frame'
+        required: true
+        type: string
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Remotion CLI
+        run: npm install -g @remotion/cli
+
+      - name: Decode props
+        run: |
+          echo "${{ inputs.props_url }}" | sed 's|data:application/json;base64,||' | base64 -d > props.json
+          echo "Props decoded:"
+          cat props.json | head -c 500
+
+      - name: Render chunk with Remotion
+        run: |
+          echo "Rendering frames ${{ inputs.start_frame }} to ${{ inputs.end_frame }}"
+          npx remotion render \
+            VideoComposition \
+            chunk-${{ inputs.chunk_id }}.mp4 \
+            --props=props.json \
+            --frames=${{ inputs.start_frame }}-${{ inputs.end_frame }} \
+            --codec=h264 \
+            --crf=23 \
+            --concurrency=2
+
+      - name: Upload chunk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ inputs.chunk_id }}
+          path: chunk-${{ inputs.chunk_id }}.mp4
+          retention-days: 7
+          compression-level: 0
