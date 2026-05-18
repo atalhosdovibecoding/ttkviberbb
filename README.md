@@ -1,0 +1,1 @@
+# TikTok Video Editor - Render Server\n\nRemote render via GitHub Actions + Remotion.\n
