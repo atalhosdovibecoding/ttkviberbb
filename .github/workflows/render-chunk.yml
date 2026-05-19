@@ -1,4 +1,5 @@
 name: Render Video Chunk
+run-name: Render ${{ inputs.job_id }} chunk ${{ inputs.chunk_id }}
 
 on:
   workflow_dispatch:
