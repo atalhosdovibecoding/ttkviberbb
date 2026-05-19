@@ -1,6 +1,9 @@
 name: Render Video Chunk
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       job_id:
@@ -16,7 +19,7 @@ on:
         required: true
         type: string
       props_url:
-        description: 'URL to download props.json (GitHub Gist raw URL)'
+        description: 'URL to download props.json'
         required: true
         type: string
       start_frame:
@@ -34,27 +37,19 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Download props from Gist
+      - name: Download props from URL
         run: |
+          if [ -z "${{ inputs.props_url }}" ]; then
+            echo "No props_url provided, skipping (probably push event)"
+            exit 0
+          fi
           echo "Downloading props from: ${{ inputs.props_url }}"
           curl -L -H "Accept: application/json" -o props.json "${{ inputs.props_url }}"
           echo "Props size: $(wc -c < props.json) bytes"
-          echo "Props preview:"
-          cat props.json | python3 -c "
-import json, sys
-d = json.load(sys.stdin)
-print('fps:', d.get('fps'))
-print('width:', d.get('width'))
-print('height:', d.get('height'))
-print('durationInFrames:', d.get('durationInFrames'))
-vs = d.get('videoSrc', '')
-print('videoSrc type:', vs[:30] if vs else 'empty')
-as_ = d.get('audioSrc', '')
-print('audioSrc type:', as_[:30] if as_ else 'none')
-"
 
       - name: Extract video asset
         run: |
+          if [ ! -f props.json ]; then exit 0; fi
           VIDEO_SRC=$(cat props.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('videoSrc',''))")
           
           if [[ -z "$VIDEO_SRC" ]]; then
@@ -63,61 +58,44 @@ print('audioSrc type:', as_[:30] if as_ else 'none')
           fi
           
           if [[ "$VIDEO_SRC" == data:* ]]; then
-            echo "Decoding video from data URI (~$(echo $VIDEO_SRC | wc -c) bytes)"
-            echo "$VIDEO_SRC" | python3 -c "
-import sys, base64, re
-data = sys.stdin.read().strip()
-b64 = re.sub(r'^data:[^;]+;base64,', '', data)
-with open('input-video.mp4', 'wb') as f:
-    f.write(base64.b64decode(b64))
-print('Video saved')
-"
+            echo "Decoding video from data URI..."
+            echo "$VIDEO_SRC" | python3 -c "import sys, base64, re; data = sys.stdin.read().strip(); b64 = re.sub(r'^data:[^;]+;base64,', '', data); open('input-video.mp4', 'wb').write(base64.b64decode(b64))"
           else
             echo "Downloading video from URL: $VIDEO_SRC"
             curl -L -o input-video.mp4 "$VIDEO_SRC"
           fi
-          
           ls -lh input-video.mp4
 
       - name: Extract audio if present
         run: |
+          if [ ! -f props.json ]; then exit 0; fi
           AUDIO_SRC=$(cat props.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('audioSrc') or '')" 2>/dev/null || echo "")
           
           if [[ -n "$AUDIO_SRC" && "$AUDIO_SRC" != "None" && "$AUDIO_SRC" != "null" ]]; then
-            echo "Audio found (${#AUDIO_SRC} bytes)"
             if [[ "$AUDIO_SRC" == data:* ]]; then
-              echo "$AUDIO_SRC" | python3 -c "
-import sys, base64, re
-data = sys.stdin.read().strip()
-b64 = re.sub(r'^data:[^;]+;base64,', '', data)
-with open('input-audio.mp3', 'wb') as f:
-    f.write(base64.b64decode(b64))
-print('Audio saved')
-"
+              echo "$AUDIO_SRC" | python3 -c "import sys, base64, re; data = sys.stdin.read().strip(); b64 = re.sub(r'^data:[^;]+;base64,', '', data); open('input-audio.mp3', 'wb').write(base64.b64decode(b64))"
             else
               curl -L -o input-audio.mp3 "$AUDIO_SRC"
             fi
-            ls -lh input-audio.mp3 2>/dev/null || echo "Audio file not created"
-          else
-            echo "No audio track"
           fi
 
       - name: Get video metadata
         id: meta
         run: |
+          if [ ! -f props.json ]; then exit 0; fi
           FPS=$(cat props.json | python3 -c "import json,sys; print(json.load(sys.stdin).get('fps', 30))")
           WIDTH=$(cat props.json | python3 -c "import json,sys; print(json.load(sys.stdin).get('width', 1080))")
           HEIGHT=$(cat props.json | python3 -c "import json,sys; print(json.load(sys.stdin).get('height', 1920))")
           echo "fps=$FPS" >> $GITHUB_OUTPUT
           echo "width=$WIDTH" >> $GITHUB_OUTPUT
           echo "height=$HEIGHT" >> $GITHUB_OUTPUT
-          echo "Video: ${WIDTH}x${HEIGHT} @ ${FPS}fps"
 
       - name: Setup FFmpeg
         uses: FedericoCarboni/setup-ffmpeg@v3
 
       - name: Render with FFmpeg
         run: |
+          if [ ! -f props.json ]; then exit 0; fi
           START=${{ inputs.start_frame }}
           END=${{ inputs.end_frame }}
           FPS=${{ steps.meta.outputs.fps }}
@@ -127,17 +105,13 @@ print('Audio saved')
           START_T=$(python3 -c "print(round($START / $FPS, 4))")
           DUR_T=$(python3 -c "print(round(($END - $START + 1) / $FPS, 4))")
           
-          echo "Rendering frames $START-$END (${START_T}s, duration ${DUR_T}s)"
-          
           VFILTER="scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2:black"
           
           if [ -f "input-audio.mp3" ]; then
-            ffmpeg -ss "$START_T" -t "$DUR_T" -i input-video.mp4               -ss "$START_T" -t "$DUR_T" -i input-audio.mp3               -vf "$VFILTER"               -c:v libx264 -crf 23 -preset fast -pix_fmt yuv420p               -c:a aac -b:a 128k               -map 0:v:0 -map 1:a:0 -shortest               -y chunk-${{ inputs.chunk_id }}.mp4
+            ffmpeg -ss "$START_T" -t "$DUR_T" -i input-video.mp4 -ss "$START_T" -t "$DUR_T" -i input-audio.mp3 -vf "$VFILTER" -c:v libx264 -crf 23 -preset fast -pix_fmt yuv420p -c:a aac -b:a 128k -map 0:v:0 -map 1:a:0 -shortest -y chunk-${{ inputs.chunk_id }}.mp4
           else
-            ffmpeg -ss "$START_T" -t "$DUR_T" -i input-video.mp4               -vf "$VFILTER"               -c:v libx264 -crf 23 -preset fast -pix_fmt yuv420p               -an -y chunk-${{ inputs.chunk_id }}.mp4
+            ffmpeg -ss "$START_T" -t "$DUR_T" -i input-video.mp4 -vf "$VFILTER" -c:v libx264 -crf 23 -preset fast -pix_fmt yuv420p -an -y chunk-${{ inputs.chunk_id }}.mp4
           fi
-          
-          ls -lh chunk-${{ inputs.chunk_id }}.mp4
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
