@@ -49,7 +49,11 @@ jobs:
       - name: Download props
         run: |
           echo "Downloading props from ${{ inputs.props_url }}"
-          curl -L -o props.json "${{ inputs.props_url }}"
+          curl -L \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/octet-stream" \
+            -o props.json \
+            "${{ inputs.props_url }}"
           echo "Props:"
           cat props.json | jq .
 
